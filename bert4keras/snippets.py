@@ -1,15 +1,11 @@
 #! -*- coding: utf-8 -*-
 # 代码合集
 
-import six
+import os, sys, six, re, json
 import logging
 import numpy as np
-import re
-import sys
 from collections import defaultdict
-import json
-import tensorflow as tf
-from bert4keras.backend import K, keras
+from bert4keras.backend import K, keras, tf
 
 _open_ = open
 is_py2 = six.PY2
@@ -84,9 +80,13 @@ def convert_to_str(text, encoding='utf-8', errors='ignore'):
 
 
 class open:
-    """模仿python自带的open函数，主要是为了同时兼容py2和py3
+    """模仿python自带的open函数
+    作用：1.主要是为了同时兼容py2和py3；2.增加了索引功能，方便读取大文件。
     """
-    def __init__(self, name, mode='r', encoding=None, errors='ignore'):
+    def __init__(
+        self, name, mode='r', encoding=None, errors=None, indexable=False
+    ):
+        self.name = name
         if is_py2:
             self.file = _open_(name, mode)
         else:
@@ -94,12 +94,44 @@ class open:
         self.encoding = encoding
         self.errors = errors
         self.iterator = None
+        if indexable:
+            if is_string(indexable) and os.path.exists(indexable):
+                self.offsets = json.load(_open_(indexable))
+            else:
+                self.create_indexes()
+                if is_string(indexable):
+                    json.dump(self.offsets, _open_(indexable, 'w'))
+
+    def create_indexes(self):
+        print('creating indexes ...')
+        self.offsets, offset = [], 0
+        pbar = keras.utils.Progbar(os.path.getsize(self.name))
+        while self.readline():
+            self.offsets.append(offset)
+            offset = self.tell()
+            pbar.update(offset)
+        self.seek(0)
+        print('indexes created.')
+
+    def __getitem__(self, key):
+        self.seek(self.offsets[key])
+        l = self.readline()
+        if self.encoding:
+            l = convert_to_unicode(l, self.encoding, self.errors)
+        return l
+
+    def __len__(self):
+        return len(self.offsets)
 
     def __iter__(self):
-        for l in self.file:
-            if self.encoding:
-                l = convert_to_unicode(l, self.encoding, self.errors)
-            yield l
+        if hasattr(self, 'offsets'):
+            for i in range(len(self)):
+                yield self[i]
+        else:
+            for l in self.file:
+                if self.encoding:
+                    l = convert_to_unicode(l, self.encoding, self.errors)
+                yield l
 
     def next(self):
         if self.iterator is None:
@@ -115,6 +147,21 @@ class open:
             text = convert_to_unicode(text, self.encoding, self.errors)
         return text
 
+    def readline(self):
+        text = self.file.readline()
+        if self.encoding:
+            text = convert_to_unicode(text, self.encoding, self.errors)
+        return text
+
+    def readlines(self):
+        if self.encoding:
+            return [
+                convert_to_unicode(text, self.encoding, self.errors)
+                for text in self.file.readlines()
+            ]
+        else:
+            return self.file.readlines()
+
     def write(self, text):
         if self.encoding:
             text = convert_to_str(text, self.encoding, self.errors)
@@ -125,6 +172,12 @@ class open:
 
     def close(self):
         self.file.close()
+
+    def tell(self):
+        return self.file.tell()
+
+    def seek(self, offset=0):
+        return self.file.seek(offset)
 
     def __enter__(self):
         return self
@@ -214,37 +267,44 @@ def parallel_apply(
         return [r[1] for r in results]
 
 
-def sequence_padding(inputs, length=None, padding=0, mode='post'):
+def sequence_padding(inputs, length=None, value=0, seq_dims=1, mode='post'):
     """Numpy函数，将序列padding到同一长度
     """
     if length is None:
-        length = max([len(x) for x in inputs])
+        length = np.max([np.shape(x)[:seq_dims] for x in inputs])
 
+    slices = [np.s_[:length] for _ in range(seq_dims)]
+    slices = tuple(slices) if len(slices) > 1 else slices[0]
     pad_width = [(0, 0) for _ in np.shape(inputs[0])]
+
     outputs = []
     for x in inputs:
-        x = x[:length]
-        if mode == 'post':
-            pad_width[0] = (0, length - len(x))
-        elif mode == 'pre':
-            pad_width[0] = (length - len(x), 0)
-        else:
-            raise ValueError('"mode" argument must be "post" or "pre".')
-        x = np.pad(x, pad_width, 'constant', constant_values=padding)
+        x = x[slices]
+        for i in range(seq_dims):
+            if mode == 'post':
+                pad_width[i] = (0, length - np.shape(x)[i])
+            elif mode == 'pre':
+                pad_width[i] = (length - np.shape(x)[i], 0)
+            else:
+                raise ValueError('"mode" argument must be "post" or "pre".')
+        x = np.pad(x, pad_width, 'constant', constant_values=value)
         outputs.append(x)
 
     return np.array(outputs)
 
 
-def truncate_sequences(maxlen, index, *sequences):
+def truncate_sequences(maxlen, indices, *sequences):
     """截断总长度至不超过maxlen
     """
     sequences = [s for s in sequences if s]
+    if not isinstance(indices, (list, tuple)):
+        indices = [indices] * len(sequences)
+
     while True:
         lengths = [len(s) for s in sequences]
         if sum(lengths) > maxlen:
             i = np.argmax(lengths)
-            sequences[i].pop(index)
+            sequences[i].pop(indices[i])
         else:
             return sequences
 
@@ -320,9 +380,7 @@ class DataGenerator(object):
             else:
 
                 def generator():
-                    indices = list(range(len(self.data)))
-                    np.random.shuffle(indices)
-                    for i in indices:
+                    for i in np.random.permutation(len(self.data)):
                         yield self.data[i]
 
             data = generator()

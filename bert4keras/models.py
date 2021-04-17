@@ -5,7 +5,7 @@ import numpy as np
 from bert4keras.layers import *
 from bert4keras.snippets import insert_arguments
 from bert4keras.snippets import delete_arguments
-from bert4keras.snippets import is_string
+from bert4keras.snippets import is_string, is_one_of
 from keras.models import Model
 import json
 
@@ -154,9 +154,10 @@ class Transformer(object):
                         if arguments.get('a_bias'):
                             a_bias = Add(name=name + '-Attention-Bias'
                                         )([inputs[3], self.attention_scores])
+                            inputs = inputs[:3] + [a_bias] + inputs[4:]
                         else:
                             a_bias = self.attention_scores
-                        inputs = inputs[:3] + [a_bias] + inputs[4:]
+                            inputs = inputs[:3] + [a_bias] + inputs[3:]
                         arguments['a_bias'] = True
                     o, a = self.layers[name](inputs, **arguments)
                     self.attention_scores = a
@@ -284,15 +285,14 @@ class Transformer(object):
         weight_value_pairs = []
         for layer, variables in mapping.items():
             layer = self.layers[layer]
-            weights = layer.trainable_weights
-            values = []
+            weights, values = [], []
 
-            for v in variables:  # 允许跳过不存在的权重
+            for w, v in zip(layer.trainable_weights, variables):  # 允许跳过不存在的权重
                 try:
                     values.append(self.load_variable(checkpoint, v))
+                    weights.append(w)
                 except Exception as e:
                     if self.ignore_invalid_weights:
-                        values.append(None)
                         print('%s, but ignored.' % e.message)
                     else:
                         raise e
@@ -310,21 +310,17 @@ class Transformer(object):
                 W = np.linalg.qr(np.random.randn(key_size, head_size))[0].T
                 if layer.attention_scale:
                     W = W * key_size**0.25 / head_size**0.25
-                for i in range(count):
-                    w, v = weights[i], values[i]
-                    if v is None:
-                        continue
-                    w_shape, v_shape = K.int_shape(w), v.shape
-                    if w_shape[-1] != v_shape[-1]:
-                        pre_shape = w_shape[:-1]
-                        v = v.reshape(pre_shape + (heads, head_size))
-                        v = np.dot(v, W)
-                        v = v.reshape(pre_shape + (heads * key_size,))
-                        values[i] = v
+                for w, v in zip(weights, values):
+                    if is_one_of(w, layer.trainable_weights[:count]):
+                        w_shape, v_shape = K.int_shape(w), v.shape
+                        if w_shape[-1] != v_shape[-1]:
+                            pre_shape = w_shape[:-1]
+                            v = v.reshape(pre_shape + (heads, head_size))
+                            v = np.dot(v, W)
+                            v = v.reshape(pre_shape + (heads * key_size,))
+                            values[weights.index(w)] = v
 
-            weight_value_pairs.extend([
-                (w, v) for w, v in zip(weights, values) if v is not None
-            ])
+            weight_value_pairs.extend(zip(weights, values))
 
         K.batch_set_value(weight_value_pairs)
 
@@ -1088,10 +1084,111 @@ class NEZHA(BERT):
                 inputs=[x, x],
                 layer=RelativePositionEmbedding,
                 input_dim=2 * 64 + 1,
-                output_dim=self.attention_head_size,
+                output_dim=self.attention_key_size,
                 embeddings_initializer='Sinusoidal',
                 name='Embedding-Relative-Position',
                 trainable=False
+            )
+
+        return self.position_bias
+
+
+class RoFormer(NEZHA):
+    """旋转式位置编码的BERT模型
+    链接：https://kexue.fm/archives/8265
+    """
+    def apply_main_layers(self, inputs, index):
+        """RoFormer的主体是基于Self-Attention的模块
+        顺序：Att --> Add --> LN --> FFN --> Add --> LN
+        """
+        x = inputs
+        z = self.layer_norm_conds[0]
+
+        attention_name = 'Transformer-%d-MultiHeadSelfAttention' % index
+        feed_forward_name = 'Transformer-%d-FeedForward' % index
+        attention_mask = self.compute_attention_bias(index)
+        position_bias = self.compute_position_bias(x)
+
+        # Self Attention
+        xi, x = x, [x, x, x, position_bias]
+        arguments = {'a_bias': None, 'p_bias': 'rotary'}
+        if attention_mask is not None:
+            arguments['a_bias'] = True
+            x.insert(3, attention_mask)
+
+        x = self.apply(
+            inputs=x,
+            layer=MultiHeadAttention,
+            arguments=arguments,
+            heads=self.num_attention_heads,
+            head_size=self.attention_head_size,
+            out_dim=self.hidden_size,
+            key_size=self.attention_key_size,
+            kernel_initializer=self.initializer,
+            name=attention_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % attention_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % attention_name
+        )
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % attention_name
+        )
+
+        # Feed Forward
+        xi = x
+        x = self.apply(
+            inputs=x,
+            layer=FeedForward,
+            units=self.intermediate_size,
+            activation=self.hidden_act,
+            kernel_initializer=self.initializer,
+            name=feed_forward_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % feed_forward_name
+        )
+
+        return x
+
+    def compute_position_bias(self, inputs=None):
+        """Sinusoidal位置编码（直接返回）
+        """
+        if self.position_bias is None:
+
+            x = inputs
+            self.position_bias = self.apply(
+                inputs=x,
+                layer=SinusoidalPositionEmbedding,
+                output_dim=self.attention_key_size,
+                merge_mode='zero',
+                name='Embedding-Rotary-Position'
             )
 
         return self.position_bias
@@ -1962,6 +2059,9 @@ class T5_Decoder(LM_Mask, T5_Base):
         """
         c, x = inputs
 
+        c = self.apply(
+            inputs=c, layer=Masking, mask_value=0.0, name='Masked-Context'
+        )
         x = self.apply(
             inputs=x,
             layer=Embedding,
@@ -2139,7 +2239,7 @@ class T5_Decoder(LM_Mask, T5_Base):
         x = self.apply(
             inputs=x,
             layer=Lambda,
-            function=lambda x: x / np.sqrt(self.hidden_size),
+            function=lambda x: x / self.hidden_size**0.5,
             mask=lambda i, m: m,
             name='Decoder-Output-Scale'
         )
@@ -2301,6 +2401,7 @@ def build_transformer_model(
         'albert_unshared': ALBERT_Unshared,
         'roberta': BERT,
         'nezha': NEZHA,
+        'roformer': RoFormer,
         'electra': ELECTRA,
         'gpt': GPT,
         'gpt2': GPT2,
@@ -2319,6 +2420,8 @@ def build_transformer_model(
     if is_string(model):
         model = model.lower()
         MODEL = models[model]
+        if model.startswith('t5.1.1'):
+            configs['version'] = 't5.1.1'
     else:
         MODEL = model
 
@@ -2333,9 +2436,6 @@ def build_transformer_model(
         MODEL = extend_with_language_model(MODEL)
     elif application == 'unilm':
         MODEL = extend_with_unified_language_model(MODEL)
-
-    if model.startswith('t5.1.1'):
-        configs['version'] = 't5.1.1'
 
     transformer = MODEL(**configs)
     transformer.build(**configs)
