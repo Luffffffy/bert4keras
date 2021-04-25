@@ -84,7 +84,7 @@ class open:
     作用：1.主要是为了同时兼容py2和py3；2.增加了索引功能，方便读取大文件。
     """
     def __init__(
-        self, name, mode='r', encoding=None, errors=None, indexable=False
+        self, name, mode='r', encoding=None, errors='strict', indexable=False
     ):
         self.name = name
         if is_py2:
@@ -271,9 +271,11 @@ def sequence_padding(inputs, length=None, value=0, seq_dims=1, mode='post'):
     """Numpy函数，将序列padding到同一长度
     """
     if length is None:
-        length = np.max([np.shape(x)[:seq_dims] for x in inputs])
+        length = np.max([np.shape(x)[:seq_dims] for x in inputs], axis=0)
+    elif not hasattr(length, '__getitem__'):
+        length = [length]
 
-    slices = [np.s_[:length] for _ in range(seq_dims)]
+    slices = [np.s_[:length[i]] for i in range(seq_dims)]
     slices = tuple(slices) if len(slices) > 1 else slices[0]
     pad_width = [(0, 0) for _ in np.shape(inputs[0])]
 
@@ -282,9 +284,9 @@ def sequence_padding(inputs, length=None, value=0, seq_dims=1, mode='post'):
         x = x[slices]
         for i in range(seq_dims):
             if mode == 'post':
-                pad_width[i] = (0, length - np.shape(x)[i])
+                pad_width[i] = (0, length[i] - np.shape(x)[i])
             elif mode == 'pre':
-                pad_width[i] = (length - np.shape(x)[i], 0)
+                pad_width[i] = (length[i] - np.shape(x)[i], 0)
             else:
                 raise ValueError('"mode" argument must be "post" or "pre".')
         x = np.pad(x, pad_width, 'constant', constant_values=value)
