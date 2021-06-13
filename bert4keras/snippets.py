@@ -588,13 +588,14 @@ class AutoRegressiveDecoder(object):
             output_scores = np.take_along_axis(
                 scores, indices, axis=None
             )  # 更新得分
+            is_end = output_ids[:, -1] == self.end_id  # 标记是否以end标记结束
             end_counts = (output_ids == self.end_id).sum(1)  # 统计出现的end标记
             if output_ids.shape[1] >= self.minlen:  # 最短长度判断
-                best_one = output_scores.argmax()  # 得分最大的那个
-                if end_counts[best_one] == min_ends:  # 如果已经终止
-                    return output_ids[best_one]  # 直接输出
+                best = output_scores.argmax()  # 得分最大的那个
+                if is_end[best] and end_counts[best] >= min_ends:  # 如果已经终止
+                    return output_ids[best]  # 直接输出
                 else:  # 否则，只保留未完成部分
-                    flag = (end_counts < min_ends)  # 标记未完成序列
+                    flag = ~is_end | (end_counts < min_ends)  # 标记未完成序列
                     if not flag.all():  # 如果有已完成的
                         inputs = [i[flag] for i in inputs]  # 扔掉已完成序列
                         output_ids = output_ids[flag]  # 扔掉已完成序列
@@ -656,9 +657,10 @@ class AutoRegressiveDecoder(object):
                     k_indices, sample_ids, axis=1
                 )  # 对齐原id
             output_ids = np.concatenate([output_ids, sample_ids], 1)  # 更新输出
+            is_end = output_ids[:, -1] == self.end_id  # 标记是否以end标记结束
             end_counts = (output_ids == self.end_id).sum(1)  # 统计出现的end标记
             if output_ids.shape[1] >= self.minlen:  # 最短长度判断
-                flag = (end_counts == min_ends)  # 标记已完成序列
+                flag = is_end & (end_counts >= min_ends)  # 标记已完成序列
                 if flag.any():  # 如果有已完成的
                     for ids in output_ids[flag]:  # 存好已完成序列
                         results.append(ids)
@@ -752,6 +754,24 @@ def longest_common_subsequence(source, target):
         else:
             i = i - 1
     return l, mapping[::-1]
+
+
+def orthogonally_resize(a, new_shape, window=2):
+    """简单的正交化缩放矩阵
+    """
+    assert a.ndim == len(new_shape)
+    slices, a_norm, w = [], np.linalg.norm(a), window
+    for i, (d1, d2) in enumerate(zip(a.shape, new_shape)):
+        if d1 != d2:
+            k = d2 // d1 + int(d2 % d1 != 0)
+            if k > 1:
+                assert d1 % w == 0
+                a = a.reshape(a.shape[:i] + (d1 // w, w) + a.shape[i + 1:])
+                a = np.repeat(a, k, axis=i)
+                a = a.reshape(a.shape[:i] + (d1 * k,) + a.shape[i + 2:])
+        slices.append(np.s_[:d2])
+    a = a[tuple(slices)]
+    return a / np.linalg.norm(a) * a_norm
 
 
 class WebServing(object):
