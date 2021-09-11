@@ -7,6 +7,7 @@ from bert4keras.backend import keras, K, is_tf_keras
 from bert4keras.snippets import is_string, string_matching
 from bert4keras.snippets import is_one_of, insert_arguments
 from bert4keras.backend import piecewise_linear
+from bert4keras.backend import root_mean_square as rms
 import re
 
 
@@ -52,7 +53,7 @@ class Adam(keras.optimizers.Optimizer):
         # 更新公式
         if indices is None:
             m_t = K.update(m, beta_1_t * m + (1 - beta_1_t) * grad)
-            v_t = K.update(v, beta_2_t * v + (1 - beta_2_t) * grad**2)
+            v_t = K.update(v, beta_2_t * v + (1 - beta_2_t) * K.square(grad))
         else:
             mv_ops = [K.update(m, beta_1_t * m), K.update(v, beta_2_t * v)]
             with tf.control_dependencies(mv_ops):
@@ -60,7 +61,7 @@ class Adam(keras.optimizers.Optimizer):
                     m, indices, (1 - beta_1_t) * grad
                 )
                 v_t = self._resource_scatter_add(
-                    v, indices, (1 - beta_2_t) * grad**2
+                    v, indices, (1 - beta_2_t) * K.square(grad)
                 )
 
         # 返回算子
@@ -186,7 +187,7 @@ class AdaFactorV1(AdaFactorBase):
         lr = self.learning_rate
 
         for i, (p, g) in enumerate(zip(params, grads)):
-            g2 = K.square(g) + self.epsilon1
+            g2 = K.square(g) + self.epsilon1  # 如果换成g**2，在keras下Embedding层会报错
             shape, dtype = K.int_shape(p), K.dtype(p)
             factored_shape = self.factored_shape(shape)
             if factored_shape is None:
@@ -203,18 +204,18 @@ class AdaFactorV1(AdaFactorBase):
                 vc = K.zeros(shape2, dtype=dtype, name='vc_' + str(i))
                 self.weights.extend([vr, vc])
                 # 定义更新
-                vr_t = self.beta2 * vr + K.mean(g2, axis=axis1, keepdims=True)
-                vc_t = self.beta2 * vc + K.mean(g2, axis=axis2, keepdims=True)
+                g2r = K.mean(g2, axis=axis1, keepdims=True)
+                g2c = K.mean(g2, axis=axis2, keepdims=True)
+                vr_t = self.beta2 * vr + (1.0 - self.beta2) * g2r
+                vc_t = self.beta2 * vc + (1.0 - self.beta2) * g2c
                 self.updates.extend([K.update(vr, vr_t), K.update(vc, vc_t)])
                 # 合成矩阵
                 v_t = vr_t * vc_t / K.mean(vr_t, axis=axis2, keepdims=True)
             # 增量主体
-            u = g / K.sqrt(v_t)
+            u = g / K.sqrt(v_t + self.epsilon1)
             # 增量裁剪
             if self.clipping_threshold is not None:
-                u_rms = K.mean(K.sum(K.square(u)))
-                d = self.clipping_threshold
-                u = u / K.maximum(1.0, u_rms / d)
+                u = u / K.maximum(1.0, rms(u) / self.clipping_threshold)
             # 增量滑动
             if self.beta1 > 0.0:
                 # 定义参数
@@ -226,7 +227,7 @@ class AdaFactorV1(AdaFactorBase):
                 u = m_t
             # 增量调整
             if self.multiply_by_parameter_scale:
-                u = u * K.maximum(K.mean(K.sum(K.square(p))), self.epsilon2)
+                u = u * K.maximum(rms(p), self.epsilon2)
             # 更新参数
             self.updates.append(K.update(p, p - lr * u))
 
@@ -256,8 +257,11 @@ class AdaFactorV2(AdaFactorBase):
                 self.add_slot(var, 'vr', value1)
                 self.add_slot(var, 'vc', value2)
 
+    def _decayed_lr(self, var_dtype):
+        return self.learning_rate
+
     def _resource_apply(self, grad, var, indices=None):
-        lr = self.learning_rate
+        lr = self._decayed_lr(var.dtype.base_dtype)
         g2 = K.square(grad) + self.epsilon1
         shape = K.int_shape(var)
         factored_shape = self.factored_shape(shape)
@@ -271,18 +275,18 @@ class AdaFactorV2(AdaFactorBase):
             vr = self.get_slot(var, 'vr')
             vc = self.get_slot(var, 'vc')
             # 定义更新
-            vr_t = self.beta2 * vr + K.mean(g2, axis=axis1, keepdims=True)
-            vc_t = self.beta2 * vc + K.mean(g2, axis=axis2, keepdims=True)
+            g2r = K.mean(g2, axis=axis1, keepdims=True)
+            g2c = K.mean(g2, axis=axis2, keepdims=True)
+            vr_t = self.beta2 * vr + (1.0 - self.beta2) * g2r
+            vc_t = self.beta2 * vc + (1.0 - self.beta2) * g2c
             vr_t, vc_t = K.update(vr, vr_t), K.update(vc, vc_t)
             # 合成矩阵
             v_t = vr_t * vc_t / K.mean(vr_t, axis=axis2, keepdims=True)
         # 增量主体
-        u = grad / K.sqrt(v_t)
+        u = grad / K.sqrt(v_t + self.epsilon1)
         # 增量裁剪
         if self.clipping_threshold is not None:
-            u_rms = K.mean(K.sum(K.square(u)))
-            d = self.clipping_threshold
-            u = u / K.maximum(1.0, u_rms / d)
+            u = u / K.maximum(1.0, rms(u) / self.clipping_threshold)
         # 增量滑动
         if self.beta1 > 0.0:
             m = self.get_slot(var, 'm')
@@ -291,7 +295,7 @@ class AdaFactorV2(AdaFactorBase):
             u = K.update(m, m_t)
         # 增量调整
         if self.multiply_by_parameter_scale:
-            u = u * K.maximum(K.mean(K.sum(K.square(var))), self.epsilon2)
+            u = u * K.maximum(rms(var), self.epsilon2)
         # 更新参数
         return K.update(var, var - lr * u)
 
