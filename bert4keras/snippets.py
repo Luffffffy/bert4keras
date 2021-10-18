@@ -2,6 +2,7 @@
 # 代码合集
 
 import os, sys, six, re, json
+import unicodedata
 import logging
 import numpy as np
 from collections import defaultdict
@@ -76,6 +77,17 @@ def convert_to_str(text, encoding='utf-8', errors='ignore'):
     else:
         if isinstance(text, bytes):
             text = text.decode(encoding, errors=errors)
+    return text
+
+
+def lowercase_and_normalize(text):
+    """转小写，并进行简单的标准化
+    """
+    if is_py2:
+        text = unicode(text)
+    text = text.lower()
+    text = unicodedata.normalize('NFD', text)
+    text = ''.join([ch for ch in text if unicodedata.category(ch) != 'Mn'])
     return text
 
 

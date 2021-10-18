@@ -204,6 +204,25 @@ class BiasAdd(Layer):
         return K.bias_add(inputs, self.bias)
 
 
+class Scale(Layer):
+    """尺度缩放层
+    说明：选择自定义一个层而不是用Lambda层的原因是要存储scale参数。
+    """
+    def __init__(self, scale=1, **kwargs):
+        super(Scale, self).__init__(**kwargs)
+        self.scale = scale
+
+    def call(self, inputs):
+        return inputs * self.scale
+
+    def get_config(self):
+        config = {
+            'scale': self.scale,
+        }
+        base_config = super(Scale, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 class Concatenate1D(Layer):
     """1维序列拼接层
     说明：本来该功能可以直接通过Concatenate层来实现，无奈Keras
@@ -242,6 +261,7 @@ class MultiHeadAttention(Layer):
         key_size=None,
         use_bias=True,
         attention_scale=True,
+        attention_dropout=None,
         return_attention_scores=False,
         kernel_initializer='glorot_uniform',
         **kwargs
@@ -253,6 +273,7 @@ class MultiHeadAttention(Layer):
         self.key_size = key_size or head_size
         self.use_bias = use_bias
         self.attention_scale = attention_scale
+        self.attention_dropout = attention_dropout
         self.return_attention_scores = return_attention_scores
         self.kernel_initializer = initializers.get(kernel_initializer)
 
@@ -353,6 +374,8 @@ class MultiHeadAttention(Layer):
             a = a + a_bias
         a = sequence_masking(a, v_mask, '-inf', -1)
         A = K.softmax(a)
+        if self.attention_dropout:
+            A = Dropout(self.attention_dropout)(A)
         # 完成输出
         o = tf.einsum('bhjk,bkhd->bjhd', A, vw)
         if p_bias == 'typical_relative':
@@ -385,6 +408,7 @@ class MultiHeadAttention(Layer):
             'key_size': self.key_size,
             'use_bias': self.use_bias,
             'attention_scale': self.attention_scale,
+            'attention_dropout': self.attention_dropout,
             'return_attention_scores': self.return_attention_scores,
             'kernel_initializer':
                 initializers.serialize(self.kernel_initializer),
@@ -1156,15 +1180,29 @@ class GlobalPointer(Layer):
     """全局指针模块
     将序列的每个(start, end)作为整体来进行判断
     """
-    def __init__(self, heads, head_size, RoPE=True, **kwargs):
+    def __init__(
+        self,
+        heads,
+        head_size,
+        RoPE=True,
+        use_bias=True,
+        kernel_initializer='glorot_uniform',
+        **kwargs
+    ):
         super(GlobalPointer, self).__init__(**kwargs)
         self.heads = heads
         self.head_size = head_size
         self.RoPE = RoPE
+        self.use_bias = use_bias
+        self.kernel_initializer = initializers.get(kernel_initializer)
 
     def build(self, input_shape):
         super(GlobalPointer, self).build(input_shape)
-        self.dense = Dense(self.head_size * self.heads * 2)
+        self.dense = Dense(
+            units=self.head_size * self.heads * 2,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer
+        )
 
     def compute_mask(self, inputs, mask=None):
         return None
@@ -1194,7 +1232,7 @@ class GlobalPointer(Layer):
         logits = sequence_masking(logits, mask, '-inf', 3)
         # 排除下三角
         mask = tf.linalg.band_part(K.ones_like(logits), 0, -1)
-        logits = logits - (1 - mask) * 1e12
+        logits = logits - (1 - mask) * K.infinity()
         # scale返回
         return logits / self.head_size**0.5
 
@@ -1206,6 +1244,9 @@ class GlobalPointer(Layer):
             'heads': self.heads,
             'head_size': self.head_size,
             'RoPE': self.RoPE,
+            'use_bias': self.use_bias,
+            'kernel_initializer':
+                initializers.serialize(self.kernel_initializer),
         }
         base_config = super(GlobalPointer, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
@@ -1259,6 +1300,7 @@ class Loss(Layer):
 custom_objects = {
     'Embedding': Embedding,
     'BiasAdd': BiasAdd,
+    'Scale': Scale,
     'Concatenate1D': Concatenate1D,
     'MultiHeadAttention': MultiHeadAttention,
     'LayerNormalization': LayerNormalization,

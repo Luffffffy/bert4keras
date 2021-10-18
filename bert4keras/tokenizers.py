@@ -6,6 +6,7 @@ from bert4keras.snippets import is_string, is_py2
 from bert4keras.snippets import open
 from bert4keras.snippets import convert_to_unicode
 from bert4keras.snippets import truncate_sequences
+from bert4keras.snippets import lowercase_and_normalize
 
 
 def load_vocab(dict_path, encoding='utf-8', simplified=False, startswith=None):
@@ -237,13 +238,7 @@ class Tokenizer(TokenizerBase):
         """基本分词函数
         """
         if self._do_lower_case:
-            if is_py2:
-                text = unicode(text)
-            text = text.lower()
-            text = unicodedata.normalize('NFD', text)
-            text = ''.join([
-                ch for ch in text if unicodedata.category(ch) != 'Mn'
-            ])
+            text = lowercase_and_normalize(text)
 
         if pre_tokenize and self._pre_tokenize is not None:
             tokens = []
@@ -368,7 +363,6 @@ class Tokenizer(TokenizerBase):
                 ):
                     return True
 
-
     def rematch(self, text, tokens):
         """给出原始的text和tokenize后的tokens的映射关系
         """
@@ -381,8 +375,7 @@ class Tokenizer(TokenizerBase):
         normalized_text, char_mapping = '', []
         for i, ch in enumerate(text):
             if self._do_lower_case:
-                ch = unicodedata.normalize('NFD', ch)
-                ch = ''.join([c for c in ch if unicodedata.category(c) != 'Mn'])
+                ch = lowercase_and_normalize(ch)
             ch = ''.join([
                 c for c in ch
                 if not (ord(c) == 0 or ord(c) == 0xfffd or self._is_control(c))
