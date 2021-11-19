@@ -245,18 +245,16 @@ def parallel_apply_generator(
                 in_queue.put((i, d), block=False)
                 break
             except six.moves.queue.Full:
-                for _ in range(out_queue.qsize()):
+                while out_queue.qsize() > max_queue_size:
                     yield out_queue.get()
                     out_count += 1
-        if in_count % max_queue_size == 0:
-            for _ in range(out_queue.qsize()):
-                yield out_queue.get()
-                out_count += 1
-
-    while out_count != in_count:
-        for _ in range(out_queue.qsize()):
+        if out_queue.qsize() > 0:
             yield out_queue.get()
             out_count += 1
+
+    while out_count != in_count:
+        yield out_queue.get()
+        out_count += 1
 
     pool.terminate()
 
@@ -291,7 +289,7 @@ def parallel_apply(
             results = sorted(generator, key=lambda d: d[0])
             return [d for i, d in results]
     else:
-        for d in generator:
+        for i, d in generator:
             callback(d)
 
 
@@ -431,6 +429,11 @@ class DataGenerator(object):
         while True:
             for d in self.__iter__(random):
                 yield d
+
+    def fortest(self, random=False):
+        while True:
+            for d in self.__iter__(random):
+                yield d[0]
 
     def to_dataset(self, types, shapes, names=None, padded_batch=False):
         """转为tf.data.Dataset格式
