@@ -2,7 +2,7 @@
 # 主要模型
 
 import numpy as np
-from bert4keras.backend import sequence_masking
+from bert4keras.backend import get_available_gpus
 from bert4keras.layers import *
 from bert4keras.snippets import insert_arguments
 from bert4keras.snippets import delete_arguments
@@ -1852,14 +1852,8 @@ class T5_Base(Transformer):
                 ],
             })
 
-        if self.version == 't5.1.1':
-            mapping['Encoder-Output-Norm'] = ['encoder/rms_norm/scale']
-            mapping['Decoder-Output-Norm'] = ['decoder/rms_norm/scale']
+        if self.version.endswith('t5.1.1'):
             mapping['Decoder-Output-LM'] = ['decoder/logits/kernel']
-            mapping = {
-                k: [i.replace('layer_norm', 'rms_norm') for i in v]
-                for k, v in mapping.items()
-            }
             for i in range(self.num_hidden_layers):
                 for layer in [
                     'Encoder-Transformer-%d-FeedForward' % i,
@@ -1870,6 +1864,13 @@ class T5_Base(Transformer):
                         mapping[layer][0][:-7] + '_1' + mapping[layer][0][-7:],
                         mapping[layer][1]
                     ]
+            if self.version == 'mt5.1.1':
+                mapping['Encoder-Output-Norm'] = ['encoder/rms_norm/scale']
+                mapping['Decoder-Output-Norm'] = ['decoder/rms_norm/scale']
+                mapping = {
+                    k: [i.replace('layer_norm', 'rms_norm') for i in v]
+                    for k, v in mapping.items()
+                }
 
         return mapping
 
@@ -2025,12 +2026,6 @@ class T5_Encoder(T5_Base):
             rate=self.dropout_rate,
             name='Encoder-Output-Dropout'
         )
-        x = self.apply(
-            inputs=x,
-            layer=Lambda,
-            function=sequence_masking,
-            name='Encoder-Output-Masked'
-        )
 
         return x
 
@@ -2082,9 +2077,6 @@ class T5_Decoder(LM_Mask, T5_Base):
         """
         c, x = inputs
 
-        c = self.apply(
-            inputs=c, layer=Masking, mask_value=0.0, name='Masked-Context'
-        )
         x = self.apply(
             inputs=x,
             layer=Embedding,
@@ -2362,10 +2354,11 @@ class T5(T5_Base):
         """
         self._encoder.build(**kwargs)
         self._decoder.build(**kwargs)
+        self._decoder.position_bias = None  # 下面call时将重新初始化
         self.encoder = self._encoder.model
         self.decoder = self._decoder.model
         self.inputs = self.encoder.inputs + self.decoder.inputs[1:]
-        self.outputs = self.decoder(
+        self.outputs = self._decoder.call(
             self.encoder.outputs + self.decoder.inputs[1:]
         )
         self.model = Model(self.inputs, self.outputs)
@@ -2396,6 +2389,36 @@ def extend_with_unified_language_model(BaseModel):
             self.with_mlm = self.with_mlm or True
 
     return UnifiedLanguageModel
+
+
+def data_parallel(model, devices=None, parts=None):
+    """通过数据并行来实现模型并行
+    参数：
+        devices：运行设备，默认为所有可用GPU；
+        parts：batch_size分配，默认为均匀划分；
+    """
+    if devices is None:
+        devices = get_available_gpus()
+    elif isinstance(devices, int):
+        devices = ['/device:GPU:%d' % i for i in range(devices)]
+
+    if parts is None:
+        parts = len(devices)
+    else:
+        assert len(devices) == len(parts)
+
+    splited_inputs = BatchSplit(parts)(model.inputs)
+    splited_outputs = [[] for _ in model.outputs]
+    for i, device in enumerate(devices):
+        with tf.device(device):
+            outputs = model(splited_inputs[i::len(devices)])
+            outputs = outputs if isinstance(outputs, list) else [outputs]
+            for j, output in enumerate(outputs):
+                splited_outputs[j].append(output)
+
+    outputs = [BatchConcat()(outputs) for outputs in splited_outputs]
+
+    return Model(model.inputs, outputs)
 
 
 def build_transformer_model(
@@ -2443,13 +2466,16 @@ def build_transformer_model(
         't5.1.1': T5,
         't5.1.1_encoder': T5_Encoder,
         't5.1.1_decoder': T5_Decoder,
+        'mt5.1.1': T5,
+        'mt5.1.1_encoder': T5_Encoder,
+        'mt5.1.1_decoder': T5_Decoder,
     }
 
     if is_string(model):
         model = model.lower()
         MODEL = models[model]
-        if model.startswith('t5.1.1'):
-            configs['version'] = 't5.1.1'
+        if model.endswith('t5.1.1'):
+            configs['version'] = model
     else:
         MODEL = model
 
